@@ -994,6 +994,9 @@ def _to_openai_base_url(base_url: str) -> str:
     MiniMax-family: ``/anthropic`` → ``/v1``; ZAI Coding Plan → ``/coding/paas/v4`` (the general
     endpoint bills separately); Kimi Code ``/coding`` → ``/coding/v1`` (the OpenAI SDK path 404s
     without it). Anthropic-only gateways keep their path.
+
+    CRITICAL: Always strip trailing slash to prevent double-slash URLs like
+    ``https://integrate.api.nvidia.com/v1//chat/completions`` when the SDK appends paths.
     """
     url = str(base_url or "").strip().rstrip("/")
     if base_url_hostname(url) == "api.actual.inc":

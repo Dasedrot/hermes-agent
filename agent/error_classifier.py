@@ -471,7 +471,19 @@ _V_POLICY_BLOCKED = _v(_R.provider_policy_blocked, **_ABORT_FALLBACK)
 _V_SSL_CERT = _v(_R.ssl_cert_verification, **_ABORT_FALLBACK)
 _V_CONTEXT_OVERFLOW = _v(_R.context_overflow, should_compress=True)
 _V_PAYLOAD_TOO_LARGE = _v(_R.payload_too_large, should_compress=True)
-_V_OVERLOADED, _V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.overloaded, _R.server_error, _R.timeout, _R.unknown))
+_TRANSIENT_FALLBACK = {"retryable": True, "should_rotate_credential": False, "should_fallback": True}
+_V_SERVER_ERROR = _v(_R.server_error, **_TRANSIENT_FALLBACK)
+_V_TIMEOUT = _v(_R.timeout, **_TRANSIENT_FALLBACK)
+# ``overloaded`` arrives from two very different places and they must NOT share a verdict:
+#   * an HTTP 5xx (503/529) — the ENDPOINT is down, so the fallback chain is the fix;
+#   * a 429/backpressure body ("server overload, please try again later", Z.AI/Zhipu 429,
+#     memory-ceiling rejections) — the server is merely busy, so the SAME key must be retried
+#     rather than rotated/fallen back early (#106205). The bare ``_V_OVERLOADED`` keeps that
+#     baseline contract (retryable, no fallback); ``_V_OVERLOADED_5XX`` is the fallback-eligible
+#     twin used only by the 5xx status handlers below.
+_V_OVERLOADED = _v(_R.overloaded)
+_V_OVERLOADED_5XX = _v(_R.overloaded, **_TRANSIENT_FALLBACK)
+_V_UNKNOWN = _v(_R.unknown)
 _V_IMAGE_TOO_LARGE, _V_IMAGE_CORRUPT = _v(_R.image_too_large), _v(_R.image_corrupt)
 _V_MULTIMODAL, _V_INVALID_ENCRYPTED = _v(_R.multimodal_tool_content_unsupported), _v(_R.invalid_encrypted_content)
 _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, should_fallback=False)
@@ -1215,8 +1227,8 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
-    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED_5XX,
+    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED_5XX,
 }
 
 

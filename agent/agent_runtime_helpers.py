@@ -1246,6 +1246,9 @@ def _revert_credential_rotation(agent) -> None:
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
+    # A new turn starts a fresh cascade budget; the shared deadline set by the first
+    # try_activate_fallback() of the previous turn must not carry over and refuse fallback.
+    agent._cascade_deadline = None
     if not agent._fallback_activated:
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks.

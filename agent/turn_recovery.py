@@ -1647,7 +1647,11 @@ _OVERFLOW_REASONS = frozenset({
 _RATE_LIMIT_REASONS = frozenset({
     FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit,
 })
-_TRANSPORT_FAILURE_REASONS = frozenset({FailoverReason.timeout, FailoverReason.overloaded})
+# server_error (500/502/504 …) is the same class of failure as timeout/overloaded: the endpoint
+# is unhealthy, not the request, so it is eligible for the fallback chain.
+_TRANSPORT_FAILURE_REASONS = frozenset({
+    FailoverReason.timeout, FailoverReason.overloaded, FailoverReason.server_error,
+})
 
 
 _LONG_CONTEXT_TIER_CAP = 200000
@@ -1875,9 +1879,16 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+    # A transport failure (timeout/overloaded/server_error) falls back when the verdict asks for
+    # it, after 2 retries, or once the retry budget is spent — never aborting the turn on a dead
+    # endpoint while a fallback provider is configured. ``classified.should_fallback`` is the same
+    # flag turn_api_error consumes, so the two gates stay in agreement.
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
-        or (_is_transport_failure and retry_count >= 2)
+        or (
+            _is_transport_failure
+            and (classified.should_fallback or retry_count >= 2 or retry_count >= max_retries)
+        )
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an

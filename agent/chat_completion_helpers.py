@@ -686,6 +686,48 @@ def cap_to_run_budget(agent, timeout: float) -> float:
         return timeout
     remaining = float(run_budget) - (time.time() - float(started))
     return min(timeout, max(60.0, remaining * 0.5))
+def _explicit_endpoint_policy(agent) -> "object | None":
+    """Return the explicitly-registered ``EndpointPolicy`` for the agent's current
+    (provider, base_url, model) route, or ``None`` when the endpoint did not opt in.
+
+    ``get_policy`` always answers with a permissive default, so the per-endpoint
+    TTFT/idle policy is opt-in: anything that must not change behaviour for every
+    provider has to consult ``has_policy`` (the same normalised key) first.
+    """
+    try:
+        from agent.endpoint_policy import has_policy, get_policy
+    except Exception:  # pragma: no cover — policy layer is optional
+        return None
+    provider = str(getattr(agent, "provider", "") or "")
+    base_url = str(getattr(agent, "base_url", "") or "")
+    model_id = str(getattr(agent, "model", "") or "")
+    if not has_policy(provider, base_url, model_id):
+        return None
+    return get_policy(provider, base_url, model_id)
+
+
+def _policy_phase_stale_timeout(policy, base, *, first_chunk_seen: bool,
+                                deadline: "float | None", now: float) -> float:
+    """Phase-aware stale threshold for an OPTED-IN endpoint (single detector, no second one).
+
+    Before the first meaningful event the attempt may wait ``policy.ttft_timeout_s`` for
+    that event (bounded by the cascade's shared deadline and by the pre-existing per-provider
+    ``base`` patience). After it, tolerated silence is ``policy.chunk_idle_timeout_s`` — the
+    post-first-token idle budget, which must not inherit the (shorter) TTFT value.
+
+    A spent cascade budget (``remaining <= 0``) yields ``0.0`` so the caller's comparison
+    ``elapsed > threshold`` trips immediately.
+    """
+    if deadline is not None:
+        remaining = policy.remaining_budget(deadline, now)
+        if remaining <= 0:
+            return 0.0
+    if first_chunk_seen:
+        return float(policy.chunk_idle_timeout_s)
+    ttft = policy.per_attempt_ttft(deadline, now) if deadline is not None else float(policy.ttft_timeout_s)
+    if base is None:
+        return float(ttft)
+    return float(min(ttft, base))
 
 
 def _cloud_stale_timeout_for(agent, api_kwargs: dict) -> float:
@@ -2079,8 +2121,31 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    # Shared cascade budget: the FIRST fallback of a turn starts the clock and every later
+    # attempt in the same turn consumes the remainder instead of each getting a fresh full
+    # budget (a per-endpoint reset would let a long chain run unbounded). Cleared per turn by
+    # restore_primary_runtime. The budget bounds the PRE-FIRST-OUTPUT acquisition phase only;
+    # once a stream starts producing output, the endpoint's own stale/idle policy governs.
+    cascade_deadline = getattr(agent, "_cascade_deadline", None)
+    if not isinstance(cascade_deadline, (int, float)) or isinstance(cascade_deadline, bool):
+        # A non-numeric value (e.g. a Mock's auto-attribute) is not a deadline; treat it as
+        # unset rather than letting it reach the comparison below.
+        cascade_deadline = None
+    if cascade_deadline is None:
+        try:
+            from agent.endpoint_policy import get_policy
+            _budget = float(get_policy(agent.provider, agent.base_url, agent.model).overall_deadline_s)
+        except Exception:
+            _budget = 300.0
+        cascade_deadline = time.monotonic() + _budget
+        agent._cascade_deadline = cascade_deadline
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
+            return _fallback_chain_exhausted(agent, reason)
+        if time.monotonic() >= cascade_deadline:
+            logger.warning(
+                "Fallback cascade budget exhausted (deadline %.0fs monotonic); "
+                "not dialling further endpoints", cascade_deadline)
             return _fallback_chain_exhausted(agent, reason)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
@@ -2135,6 +2200,30 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                     fb_api_mode = "chat_completions"
                 elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
                     fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
+
+            # Endpoint-scoped breaker gate: do not re-dial an endpoint that is OPEN and still
+            # cooling down, or whose single HALF_OPEN probe is already in flight. ``can_attempt``
+            # hands out AND RESERVES the probe when it returns True; the stream outcome then
+            # records success/failure and a caller cancellation releases it, so no probe can
+            # stay reserved and no endpoint is dialled while it is known-dead.
+            try:
+                from agent.endpoint_policy import has_policy as _has_policy
+                from agent.endpoint_policy import ensure_policy_for_endpoint as _ensure_policy
+                from agent.endpoint_breaker import can_attempt as _breaker_can_attempt
+                # Production opt-in registration for the CANDIDATE endpoint: known identity
+                # (provider, base_url, model) is available here and the breaker gate below
+                # consults ``has_policy`` on the same triple — so the policy must be active
+                # BEFORE the gate. Non-NIM candidates return False and keep old behaviour.
+                _ensure_policy(fb_provider, fb_base_url, fb_model)
+                # §10: only an endpoint that registered an EndpointPolicy participates. Every
+                # other endpoint keeps the pre-existing fallback behaviour untouched.
+                if _has_policy(fb_provider, fb_base_url, fb_model) and not _breaker_can_attempt(fb_provider, fb_base_url, fb_model):
+                    logger.info("Skipping fallback endpoint %s/%s: breaker OPEN or probe in flight",
+                                fb_provider, fb_model)
+                    unavailable.add(fb_key)
+                    continue
+            except Exception:
+                logger.debug("Endpoint breaker gate unavailable; allowing fallback candidate", exc_info=True)
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
 
@@ -2191,6 +2280,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         except Exception as e:
             if fb_provider == "nous":
                 unavailable.add(fb_key)
+            # The breaker gate above may have RESERVED the single HALF_OPEN probe for this
+            # candidate. Activation failing here is not an endpoint-health verdict, so the
+            # reservation must be released or that endpoint refuses every later caller forever
+            # (§4 invariant). ``locals().get`` because the exception may predate ``fb_base_url``.
+            try:
+                from agent.endpoint_breaker import release_probe as _breaker_release
+                _breaker_release(fb_provider, locals().get("fb_base_url") or "", fb_model)
+            except Exception:
+                logger.debug("Probe release after failed activation skipped", exc_info=True)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
             continue  # try next in chain
 
@@ -2869,6 +2967,11 @@ class _StreamingCall(StreamingWaitMonitor):
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
+        # Opt-in per-endpoint TTFT/idle policy (None => the pre-existing single stale
+        # detector, unchanged for every non-registered endpoint) and the cascade's
+        # absolute monotonic deadline (None => no shared fallback budget).
+        self._endpoint_policy = None
+        self._cascade_deadline = None
         self.stream_attempt_lock = threading.Lock()
         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
         self._stale_counted_attempts: set[int] = set()  # breaker counts each attempt once
@@ -3308,11 +3411,18 @@ class _StreamingCall(StreamingWaitMonitor):
         if self._stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(f"stream attempt {stream_attempt_id} was superseded")
         if stream.final_response is not None:
-            return self._adopt_final_response(stream.final_response)
-        return self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
+            _final = self._adopt_final_response(stream.final_response)
+            self._record_breaker_outcome(success=True)
+            return _final
+        _final = self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
             finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
             refusal_parts=refusal_parts)
+        # Reached only on normal completion: ``_finish_chat_stream`` raises EmptyStreamError for a
+        # zero-event stream, which routes to ``_handle_stream_error`` as a QUALIFYING failure
+        # instead (empty stream -> breaker failure), never through here.
+        self._record_breaker_outcome(success=True)
+        return _final
 
     def _adopt_final_response(self, final_response):
         """Adapter returned a completed response for ``stream=True``: switch the
@@ -3632,6 +3742,44 @@ class _StreamingCall(StreamingWaitMonitor):
             diagnostic=True,
         )
 
+    def _record_breaker_outcome(self, *, success: bool = False, qualifies: bool = False,
+                                cancelled: bool = False) -> None:
+        """Record this attempt's result against the ACTIVE endpoint's breaker.
+
+        Exactly one of the three outcomes is applied per attempt, which is what keeps the
+        "every acquisition ends in success | failure | release" invariant true:
+          * ``cancelled``  -> release the HALF_OPEN probe, trip nothing (caller cancellation
+                              says nothing about endpoint health);
+          * ``success``    -> full stream completion (the endpoint is healthy; HALF_OPEN->CLOSED);
+          * ``qualifies``  -> a transient/5xx/empty-stream failure (CLOSED->OPEN, HALF_OPEN->OPEN);
+        a non-qualifying failure is a no-op for a CLOSED breaker.
+        """
+        try:
+            from agent import endpoint_breaker as _eb
+        except Exception:  # pragma: no cover — breaker layer is optional
+            return
+        provider = str(getattr(self.agent, "provider", "") or "")
+        base_url = str(getattr(self.agent, "base_url", "") or "")
+        model = str(getattr(self.agent, "model", "") or "")
+        # §10: the breaker is OPT-IN. An endpoint without a registered EndpointPolicy keeps its
+        # pre-existing behaviour (Anthropic/Gemini/Bedrock all share this fallback machinery and
+        # must not gain a breaker merely because they pass through here).
+        try:
+            from agent.endpoint_policy import has_policy as _has_policy
+            if not _has_policy(provider, base_url, model):
+                return
+        except Exception:  # pragma: no cover — policy layer is optional
+            return
+        try:
+            if cancelled:
+                _eb.release_probe(provider, base_url, model)
+            elif success:
+                _eb.record_success(provider, base_url, model)
+            elif qualifies:
+                _eb.record_failure(provider, base_url, model, qualifies=True)
+        except Exception:
+            logger.debug("Endpoint breaker outcome recording failed", exc_info=True)
+
     def _handle_stream_error(self, e: Exception, attempt: int, max_retries: int) -> bool:
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
@@ -3641,6 +3789,9 @@ class _StreamingCall(StreamingWaitMonitor):
         # poll loop raises InterruptedError).
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
+            # Caller cancellation is not an endpoint-health signal, but the HALF_OPEN probe
+            # (if we held it) must not stay reserved or the endpoint is refused forever.
+            self._record_breaker_outcome(cancelled=True)
             return False
         _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout))
         # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader,
@@ -3687,6 +3838,9 @@ class _StreamingCall(StreamingWaitMonitor):
             # preamble beats a failed action; no tool has executed yet).
             if not (_partial_tool_in_flight and _is_transient and attempt < max_retries):
                 logger.warning("Streaming failed after partial delivery, not retrying: %s", e)
+                # Mid-stream failure: the endpoint is unhealthy end-to-end, so the breaker
+                # records it; the caller must NOT fall back (delivered text would duplicate).
+                self._record_breaker_outcome(qualifies=True)
                 self.result["error"] = e
                 return False
             # Marker explains the re-streamed preamble (``_emit_stream_drop`` logs the WARNING);
@@ -3721,6 +3875,9 @@ class _StreamingCall(StreamingWaitMonitor):
             logger.exception("Streaming failed before delivery: %s", e)
             if self._unmask_server_error_with_nonstreaming(e):
                 return False
+        # A transient/5xx/empty-stream failure is an ENDPOINT failure: trip the breaker so the
+        # dead endpoint is skipped on later turns (whether to fall back is the caller's call).
+        self._record_breaker_outcome(qualifies=bool(_is_transient or _is_empty_stream))
         # Propagate to the main retry loop (credential rotation, fallback, backoff).
         self.result["error"] = e
         return False
@@ -3959,6 +4116,22 @@ class _StreamingCall(StreamingWaitMonitor):
         crashed endpoint forever. Cloud values scale with context size and are
         floored for known reasoning models (else BrokenPipeError from the gateway)."""
         base = _configured_stale_base(self.agent)
+        # Production opt-in registration: make the NIM endpoint's policy ACTIVE before the
+        # watchdog or the breaker is consulted. Non-NIM endpoints are untouched by
+        # ``ensure_policy_for_endpoint`` (it returns False), so ``_explicit_endpoint_policy``
+        # keeps returning None for them and this call is a no-op for every other provider.
+        try:
+            from agent.endpoint_policy import ensure_policy_for_endpoint as _ensure_policy
+            _ensure_policy(
+                str(getattr(self.agent, "provider", "") or ""),
+                str(getattr(self.agent, "base_url", "") or ""),
+                str(getattr(self.agent, "model", "") or ""),
+            )
+        except Exception:
+            logger.debug("Endpoint-policy registration skipped", exc_info=True)
+        # Opt-in per-endpoint policy: None for every endpoint that did not register one,
+        # so the watchdog keeps its pre-existing patience (no blast radius).
+        self._endpoint_policy = _explicit_endpoint_policy(self.agent)
         if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
             self._stream_stale_timeout = _local_stream_stale_timeout_default()
             logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs",

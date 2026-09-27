@@ -449,6 +449,15 @@ class ClientLifecycleMixin:
         # No SDK retry loop: the outer loop owns retries/rotation/fallback, and SDK retries stretch a hung
         # request ~3x past our stale detector.
         request_kwargs["max_retries"] = 0
+        # §7 / D6: NIM opt-in endpoints get a per-request SDK read timeout that cannot undercut
+        # the endpoint's idle policy. Non-opt-in endpoints keep the SDK default.
+        try:
+            from agent.endpoint_policy import has_policy, get_policy
+            if has_policy(self.provider, self.base_url, self.model):
+                policy = get_policy(self.provider, self.base_url, self.model)
+                request_kwargs["timeout"] = policy.read_timeout_for_sdk()
+        except Exception:
+            logger.debug("NIM SDK timeout injection skipped", exc_info=True)
         is_copilot = base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
         if is_copilot and self._api_kwargs_have_image_parts(api_kwargs or {}):
             from hermes_cli.copilot_auth import copilot_request_headers
