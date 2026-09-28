@@ -1961,6 +1961,27 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     """A billing switch is a WARNING naming the profile, both models and the remedy: the gateway
     persists the turn as a transient failure otherwise, and nothing in the log says the paid
     model was refused for credits or how to fix it (#115702). Other reasons stay INFO."""
+    # PART 1: Terminal-paid fallback WARNING (deepseek/deepseek-flash)
+    if fb_provider == "deepseek" and fb_model == "deepseek-flash":
+        call_role = ("delegated" if getattr(agent, "is_subagent", False)
+                     else ("architect" if getattr(agent, "platform", None) != "subagent" else "child-agent"))
+        reason_text = _fallback_reason_text(reason) if reason else "unknown"
+        logger.warning(
+            "cascade reached terminal PAID fallback: primary=%s terminal=%s/%s reason=%s role=%s",
+            old_model, fb_provider, fb_model, reason_text, call_role,
+        )
+        # Still emit billing warning if applicable
+        if reason == FailoverReason.billing:
+            from hermes_constants import get_hermes_home, profile_name_for_home
+            profile = profile_name_for_home(get_hermes_home()) or "default"
+            remedy = "hermes model" if profile == "default" else f"hermes -p {profile} model"
+            logger.warning(
+                "Profile %s: %s via %s refused for billing/credits — using fallback %s via %s. "
+                "Top up credits, or run `%s` to pick a model this account can use.",
+                profile, old_model, old_provider, fb_model, fb_provider, remedy,
+            )
+        return
+
     if reason != FailoverReason.billing:
         logger.info("Fallback activated: %s → %s (%s)", old_model, fb_model, fb_provider)
         return
@@ -2015,7 +2036,26 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
         return True
     if _candidate_pool_exhausted(agent, fb_provider, fb_model):
-        logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
+        # PART 2: Enhanced credential-skip observability - include cooldown remaining
+        pool = getattr(agent, "_credential_pool", None)
+        if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
+            try:
+                from agent.credential_pool import load_pool
+                pool = load_pool(fb_provider)
+            except Exception:
+                pool = None
+        remaining = None
+        if pool is not None:
+            try:
+                until = pool.next_available_at(model=fb_model)
+                if until is not None:
+                    remaining = max(0, int(until - time.time()))
+            except Exception:
+                pass
+        if remaining is not None:
+            logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown); cooldown_remaining_s=%d", fb_provider, fb_model, remaining)
+        else:
+            logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
